@@ -242,6 +242,7 @@ class TermFields {
                 border-bottom-left-radius: 0;
                 width: auto !important;
                 min-width: 50px;
+                border-left: none;
             }
 
             .term-fields-amount-type-wrapper input:focus,
