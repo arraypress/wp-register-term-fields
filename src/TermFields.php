@@ -9,7 +9,7 @@
  * @package     ArrayPress\WP\RegisterTermFields
  * @copyright   Copyright (c) 2025, ArrayPress Limited
  * @license     GPL2+
- * @version     1.0.0
+ * @version     1.1.0
  * @author      David Sherlock
  */
 
@@ -37,6 +37,13 @@ class TermFields {
     protected static array $fields = [];
 
     /**
+     * Whether CSS has been output.
+     *
+     * @var bool
+     */
+    protected static bool $css_output = false;
+
+    /**
      * The taxonomy this instance manages.
      *
      * @var string
@@ -49,13 +56,14 @@ class TermFields {
      * @var array
      */
     protected static array $field_types = [
-            'text'     => 'sanitize_text_field',
-            'textarea' => 'sanitize_textarea_field',
-            'number'   => null, // Handled specially based on step
-            'select'   => null, // Validated against options
-            'checkbox' => null, // Boolean cast
-            'url'      => 'esc_url_raw',
-            'email'    => 'sanitize_email',
+            'text'        => 'sanitize_text_field',
+            'textarea'    => 'sanitize_textarea_field',
+            'number'      => null, // Handled specially based on step
+            'select'      => null, // Validated against options
+            'checkbox'    => null, // Boolean cast
+            'url'         => 'esc_url_raw',
+            'email'       => 'sanitize_email',
+            'amount_type' => null, // Combined amount + type field
     ];
 
     /**
@@ -108,6 +116,10 @@ class TermFields {
                 'rows'              => 5,
                 'sanitize_callback' => null,
                 'capability'        => 'manage_categories',
+            // Amount type specific
+                'type_options'      => [],
+                'type_meta_key'     => '',
+                'type_default'      => '',
         ];
 
         foreach ( $fields as $key => $field ) {
@@ -119,6 +131,16 @@ class TermFields {
             $type = $field['type'] ?? 'text';
             if ( ! array_key_exists( $type, self::$field_types ) ) {
                 throw new Exception( sprintf( 'Invalid field type "%s" for field "%s".', $type, $key ) );
+            }
+
+            // Validate amount_type specific requirements
+            if ( $type === 'amount_type' ) {
+                if ( empty( $field['type_options'] ) ) {
+                    throw new Exception( sprintf( 'Field "%s" of type "amount_type" requires "type_options" to be set.', $key ) );
+                }
+                if ( empty( $field['type_meta_key'] ) ) {
+                    throw new Exception( sprintf( 'Field "%s" of type "amount_type" requires "type_meta_key" to be set.', $key ) );
+                }
             }
 
             self::$fields[ $this->taxonomy ][ $key ] = wp_parse_args( $field, $defaults );
@@ -163,6 +185,77 @@ class TermFields {
         // Save fields
         add_action( "created_{$this->taxonomy}", [ $this, 'save_fields' ] );
         add_action( "edited_{$this->taxonomy}", [ $this, 'save_fields' ] );
+
+        // Output CSS in footer if we have amount_type fields
+        if ( $this->has_amount_type_fields() && ! self::$css_output ) {
+            add_action( 'admin_footer', [ $this, 'output_css' ] );
+        }
+    }
+
+    /**
+     * Check if this taxonomy has any amount_type fields.
+     *
+     * @return bool
+     */
+    protected function has_amount_type_fields(): bool {
+        $fields = self::get_fields( $this->taxonomy );
+
+        foreach ( $fields as $field ) {
+            if ( $field['type'] === 'amount_type' ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Output CSS for amount_type fields.
+     *
+     * @return void
+     */
+    public function output_css(): void {
+        if ( self::$css_output ) {
+            return;
+        }
+
+        self::$css_output = true;
+        ?>
+        <style>
+            .term-fields-amount-type-wrapper {
+                display: inline-flex;
+                align-items: stretch;
+                max-width: 250px;
+            }
+
+            .term-fields-amount-type-wrapper input[type="text"],
+            .term-fields-amount-type-wrapper input[type="number"] {
+                border-top-right-radius: 0;
+                border-bottom-right-radius: 0;
+                margin-right: -1px;
+                flex: 1;
+                min-width: 0;
+            }
+
+            .term-fields-amount-type-wrapper select {
+                border-top-left-radius: 0;
+                border-bottom-left-radius: 0;
+                width: auto !important;
+                min-width: 50px;
+            }
+
+            .term-fields-amount-type-wrapper input:focus,
+            .term-fields-amount-type-wrapper select:focus {
+                position: relative;
+                z-index: 1;
+            }
+
+            /* Ensure proper alignment in edit form table */
+            .form-field .term-fields-amount-type-wrapper {
+                display: inline-flex;
+            }
+        </style>
+        <?php
     }
 
     /**
@@ -209,7 +302,16 @@ class TermFields {
                 $value = $field['default'];
             }
 
-            $this->render_edit_field( $meta_key, $field, $value );
+            // For amount_type, also get the type value
+            $type_value = '';
+            if ( $field['type'] === 'amount_type' && ! empty( $field['type_meta_key'] ) ) {
+                $type_value = get_term_meta( $term->term_id, $field['type_meta_key'], true );
+                if ( '' === $type_value && '' !== $field['type_default'] ) {
+                    $type_value = $field['type_default'];
+                }
+            }
+
+            $this->render_edit_field( $meta_key, $field, $value, $type_value );
         }
     }
 
@@ -222,12 +324,13 @@ class TermFields {
      * @return void
      */
     protected function render_add_field( string $meta_key, array $field ): void {
-        $value = $field['default'];
-        $id    = esc_attr( $meta_key );
+        $value      = $field['default'];
+        $type_value = $field['type_default'] ?? '';
+        $id         = esc_attr( $meta_key );
         ?>
         <div class="form-field term-<?php echo $id; ?>-wrap">
             <label for="<?php echo $id; ?>"><?php echo esc_html( $field['label'] ); ?></label>
-            <?php $this->render_field_input( $meta_key, $field, $value ); ?>
+            <?php $this->render_field_input( $meta_key, $field, $value, $type_value ); ?>
             <?php if ( ! empty( $field['description'] ) ) : ?>
                 <p><?php echo esc_html( $field['description'] ); ?></p>
             <?php endif; ?>
@@ -238,13 +341,14 @@ class TermFields {
     /**
      * Render a single field on the edit form.
      *
-     * @param string $meta_key The field's meta key.
-     * @param array  $field    The field configuration.
-     * @param mixed  $value    The current field value.
+     * @param string $meta_key   The field's meta key.
+     * @param array  $field      The field configuration.
+     * @param mixed  $value      The current field value.
+     * @param string $type_value The current type value (for amount_type fields).
      *
      * @return void
      */
-    protected function render_edit_field( string $meta_key, array $field, $value ): void {
+    protected function render_edit_field( string $meta_key, array $field, $value, string $type_value = '' ): void {
         $id = esc_attr( $meta_key );
         ?>
         <tr class="form-field term-<?php echo $id; ?>-wrap">
@@ -252,7 +356,7 @@ class TermFields {
                 <label for="<?php echo $id; ?>"><?php echo esc_html( $field['label'] ); ?></label>
             </th>
             <td>
-                <?php $this->render_field_input( $meta_key, $field, $value ); ?>
+                <?php $this->render_field_input( $meta_key, $field, $value, $type_value ); ?>
                 <?php if ( ! empty( $field['description'] ) ) : ?>
                     <p class="description"><?php echo esc_html( $field['description'] ); ?></p>
                 <?php endif; ?>
@@ -264,13 +368,14 @@ class TermFields {
     /**
      * Render the appropriate input element based on field type.
      *
-     * @param string $meta_key The field's meta key.
-     * @param array  $field    The field configuration.
-     * @param mixed  $value    The current field value.
+     * @param string $meta_key   The field's meta key.
+     * @param array  $field      The field configuration.
+     * @param mixed  $value      The current field value.
+     * @param string $type_value The current type value (for amount_type fields).
      *
      * @return void
      */
-    protected function render_field_input( string $meta_key, array $field, $value ): void {
+    protected function render_field_input( string $meta_key, array $field, $value, string $type_value = '' ): void {
         $id   = esc_attr( $meta_key );
         $name = esc_attr( $meta_key );
         $type = $field['type'];
@@ -290,6 +395,10 @@ class TermFields {
 
             case 'number':
                 $this->render_number( $id, $name, $field, $value );
+                break;
+
+            case 'amount_type':
+                $this->render_amount_type( $id, $name, $field, $value, $type_value );
                 break;
 
             case 'url':
@@ -419,6 +528,47 @@ class TermFields {
     }
 
     /**
+     * Render an amount type field (combined amount input + type selector).
+     *
+     * @param string $id         The field ID attribute.
+     * @param string $name       The field name attribute.
+     * @param array  $field      The field configuration.
+     * @param mixed  $value      The current amount value.
+     * @param string $type_value The current type value.
+     *
+     * @return void
+     */
+    protected function render_amount_type( string $id, string $name, array $field, $value, string $type_value ): void {
+        $type_options  = $this->get_type_options( $field );
+        $type_name     = esc_attr( $field['type_meta_key'] );
+        $placeholder   = ! empty( $field['placeholder'] ) ? ' placeholder="' . esc_attr( $field['placeholder'] ) . '"' : ' placeholder="0.00"';
+        $min           = isset( $field['min'] ) ? ' min="' . esc_attr( $field['min'] ) . '"' : ' min="0"';
+        $max           = isset( $field['max'] ) ? ' max="' . esc_attr( $field['max'] ) . '"' : '';
+        $step          = isset( $field['step'] ) ? ' step="' . esc_attr( $field['step'] ) . '"' : ' step="any"';
+
+        // Default to first option if no type value
+        if ( empty( $type_value ) && ! empty( $type_options ) ) {
+            $type_value = array_key_first( $type_options );
+        }
+        ?>
+        <div class="term-fields-amount-type-wrapper">
+            <input type="number"
+                   id="<?php echo $id; ?>"
+                   name="<?php echo $name; ?>"
+                   value="<?php echo esc_attr( $value ); ?>"
+                    <?php echo $min . $max . $step . $placeholder; ?> />
+            <select id="<?php echo $id; ?>-type" name="<?php echo $type_name; ?>">
+                <?php foreach ( $type_options as $option_value => $option_label ) : ?>
+                    <option value="<?php echo esc_attr( $option_value ); ?>" <?php selected( $type_value, $option_value ); ?>>
+                        <?php echo esc_html( $option_label ); ?>
+                    </option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <?php
+    }
+
+    /**
      * Get options for a select field.
      *
      * Handles both static arrays and callable options.
@@ -429,6 +579,25 @@ class TermFields {
      */
     protected function get_select_options( array $field ): array {
         $options = $field['options'];
+
+        if ( is_callable( $options ) ) {
+            $options = call_user_func( $options );
+        }
+
+        return is_array( $options ) ? $options : [];
+    }
+
+    /**
+     * Get type options for an amount_type field.
+     *
+     * Handles both static arrays and callable options.
+     *
+     * @param array $field The field configuration.
+     *
+     * @return array Array of options as value => label pairs.
+     */
+    protected function get_type_options( array $field ): array {
+        $options = $field['type_options'] ?? [];
 
         if ( is_callable( $options ) ) {
             $options = call_user_func( $options );
@@ -455,6 +624,10 @@ class TermFields {
             // Handle checkbox separately (unchecked = not in POST)
             if ( 'checkbox' === $field['type'] ) {
                 $value = isset( $_POST[ $meta_key ] ) ? 1 : 0;
+            } elseif ( 'amount_type' === $field['type'] ) {
+                // Handle amount_type - save both amount and type
+                $this->save_amount_type_field( $term_id, $meta_key, $field );
+                continue;
             } else {
                 if ( ! isset( $_POST[ $meta_key ] ) ) {
                     continue;
@@ -472,6 +645,67 @@ class TermFields {
                 update_term_meta( $term_id, $meta_key, $value );
             }
         }
+    }
+
+    /**
+     * Save amount_type field values (both amount and type).
+     *
+     * @param int    $term_id  The term ID.
+     * @param string $meta_key The amount meta key.
+     * @param array  $field    The field configuration.
+     *
+     * @return void
+     */
+    protected function save_amount_type_field( int $term_id, string $meta_key, array $field ): void {
+        $type_meta_key = $field['type_meta_key'];
+
+        // Get and sanitize amount
+        $amount = isset( $_POST[ $meta_key ] ) ? $_POST[ $meta_key ] : '';
+        $amount = $this->sanitize_amount_value( $amount, $field );
+
+        // Get and sanitize type
+        $type         = isset( $_POST[ $type_meta_key ] ) ? $_POST[ $type_meta_key ] : '';
+        $type_options = $this->get_type_options( $field );
+
+        // Validate type against options
+        if ( ! array_key_exists( $type, $type_options ) ) {
+            $type = $field['type_default'] ?? array_key_first( $type_options );
+        }
+
+        // Update or delete amount
+        if ( '' === $amount || null === $amount || $amount <= 0 ) {
+            delete_term_meta( $term_id, $meta_key );
+            delete_term_meta( $term_id, $type_meta_key );
+        } else {
+            update_term_meta( $term_id, $meta_key, $amount );
+            update_term_meta( $term_id, $type_meta_key, $type );
+        }
+    }
+
+    /**
+     * Sanitize an amount value.
+     *
+     * @param mixed $value The raw value to sanitize.
+     * @param array $field The field configuration.
+     *
+     * @return float|string The sanitized value or empty string.
+     */
+    protected function sanitize_amount_value( $value, array $field ) {
+        if ( '' === $value || null === $value ) {
+            return '';
+        }
+
+        $value = floatval( $value );
+
+        // Apply min/max constraints
+        if ( isset( $field['min'] ) && $value < $field['min'] ) {
+            $value = $field['min'];
+        }
+        if ( isset( $field['max'] ) && $value > $field['max'] ) {
+            $value = $field['max'];
+        }
+
+        return $value > 0 ? $value : '';
     }
 
     /**
